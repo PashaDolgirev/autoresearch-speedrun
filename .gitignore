@@ -1,0 +1,12 @@
+# Per-machine experiment state
+baseline.tsv
+results.tsv
+run.log
+logs/
+
+# Downloaded data
+data/
+
+# Python
+__pycache__/
+*.pyc
