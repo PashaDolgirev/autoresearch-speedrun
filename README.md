@@ -254,6 +254,7 @@ borrowed directly from upstream.
 | `train.py` | **yes**, except a tiny `DO NOT MODIFY` framework-contract block (SEED + TIME_BUDGET_S + the time-up early stop) | record-18 modded-nanogpt; single agent-editable file |
 | `prepare.py` | no | one-time FineWeb10B GPT-2-token download into `./data/fineweb10B/` |
 | `run.sh` | no | wraps `torchrun ... train.py`, passes `SEED` and `TIME_BUDGET_S` |
+| `run_with_retry.sh` | no | wraps `bash run.sh` with a 240 s watchdog + retries; agent should always call this, not bare `run.sh` |
 | `requirements.txt` | no | deps |
 | `program.md` | human-edited | the agent's skill / instructions |
 | `literature/` | read-only | curated 25-paper 2025–2026 arXiv shortlist for hypothesis formation (PDFs + `literature/README.md` index, grouped by plug-in surface) |
@@ -290,10 +291,13 @@ pip install -r requirements.txt
 python prepare.py
 
 # 3. Calibrate: run the unmodified baseline at seeds 0..9.
-#    First run takes ~3-5 min for torch.compile; subsequent runs ~2-3 min.
-#    Total ~30 min wall clock.
+#    Use `run_with_retry.sh`, NOT bare `run.sh` — there's a residual ~20%
+#    NCCL hang rate on this A100 + torch 2.7.1 + NCCL 2.26.2 combo, and the
+#    retry wrapper kills+retries hung runs at a 240 s wall-clock cap.
+#    First run takes ~3-5 min for torch.compile; subsequent runs ~95 sec
+#    each (plus a few extra runs from hang retries). Total ~25-30 min.
 for s in 0 1 2 3 4 5 6 7 8 9; do
-    SEED=$s bash run.sh > run.log 2>&1
+    SEED=$s bash run_with_retry.sh > run.log 2>&1
     echo "seed=$s: $(grep 'val_loss:' run.log | tail -1)" | tee -a calibration.txt
 done
 
@@ -301,14 +305,145 @@ done
 #    (schema in program.md). Append a 'baseline' row to results.tsv.
 
 # 5. Point your agent at program.md and let it go.
+#    I run Claude Code with `--dangerously-skip-permissions` for this so
+#    the agent never blocks on a permission prompt for `bash`, `git`,
+#    `Edit`, etc. — overnight autonomous operation requires no human in
+#    the loop. The rented A100 box is ephemeral and only has the FineWeb
+#    data + this repo on it, so the blast radius of "skip permissions" is
+#    contained to the experiment itself.
 ```
+
+## Checking in on the run
+
+Everything is plain text on disk — you can `ssh` in anytime and see the
+state without interrupting the agent. Nothing is in-memory-only. The
+agent itself runs with `--dangerously-skip-permissions`, so it makes
+progress without waiting on you; you check in when you want to, not
+because it's blocked.
+
+### What's persisted, and when it changes
+
+| File | Updates | What you see |
+|---|---|---|
+| `results.tsv` | append-only, one row per stage-decision per candidate | every candidate's outcome: commit, stage (`screen`/`robust`), seeds_passed (e.g. `3/3`, `9/10`), mean/max val_loss, status (`promising` / `keep` / `discard` / `crash`), description |
+| `baseline.tsv` | overwritten on every KEEP | per-seed val_loss of the *current best* (10 rows). Numbers drift down over time as ESTABLISHED candidates accumulate. |
+| `git log` (current branch) | one commit per ESTABLISHED candidate. Failed candidates are `git reset --hard HEAD~1`'d, so they don't appear here. | the chain of accepted improvements only, each with the agent's commit message |
+| `run.log` | overwritten *per run* | the currently running experiment's live stdout (val_loss / train_time / step lines, peak memory at the end) |
+| `logs/<uuid>.txt` | one file per run, ever (uuid-named, never overwritten) | every run's full log, including the snapshot of `train.py` that was used for that run |
+
+### What to look at, fast
+
+```bash
+cd autoresearch-speedrun
+
+# Current best — per-seed val_loss of the accepted baseline.
+cat baseline.tsv
+
+# Every candidate's outcome. Append-only; tail for recent.
+tail -30 results.tsv
+
+# Accepted-improvement chain: each non-revert commit is one win.
+git log --oneline -20
+
+# Counts by outcome.
+awk -F'\t' 'NR>1 {print $6}' results.tsv | sort | uniq -c
+```
+
+### Watching a live run
+
+```bash
+# Whatever's training right now (run.log is overwritten each run).
+tail -f run.log
+
+# Or the per-run persistent log of the most recent run:
+tail -f "logs/$(ls -t logs/ | head -1)"
+```
+
+### Is anything happening right now?
+
+```bash
+ps aux | grep -E "torchrun|train\.py" | grep -v grep
+nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader
+```
+
+`results.tsv` and `git log` together tell the whole story over coffee — the
+ledger of attempts and the ledger of wins, respectively.
+
+## Results — first overnight run (2026-05-16/17, 8× A100 40 GB, ~6.7 h)
+
+Headline numbers, paired across the 10 calibration seeds:
+
+| | Baseline (record 18 + A100 shims, commit `6385af7`) | Final (commit `ef53b87`) | Δ |
+|---|---|---|---|
+| Mean val_loss @ 90 s | **3.9249** | **3.8093** | **−0.116** |
+| Max across 10 seeds | 3.9346 | 3.8202 | −0.114 |
+| Min across 10 seeds | 3.9177 | 3.7986 | −0.119 |
+| Spread (max − min) | 0.0169 | 0.0216 | (similar) |
+
+That's ~6.8× the per-run seed-noise spread — real signal, not chance. Six
+candidates passed the 10-seed paired-acceptance bar:
+
+| # | Commit | Change | Source | Δ |
+|---|---|---|---|---|
+| 1 | `5382153` | EMA at eval, decay=0.9 | literature ([arXiv 2502.06761](https://arxiv.org/abs/2502.06761)) | **−0.0730** |
+| 2 | `881444e` | `num_iterations` 1390 → 400 | own reasoning (schedule realignment) | −0.0072 |
+| 3 | `d1d3c7e` | `cooldown_frac` 0.4 → 0.85 | own reasoning | −0.0265 |
+| 4 | `6f7d132` | EMA decay 0.9 → 0.95 (re-tune) | literature follow-up | −0.0037 |
+| 5 | `6ab97db` | linear → cosine LR cooldown | standard ML | −0.0017 |
+| 6 | `ef53b87` | `embed_lr` 0.6 → 0.5 (rescue) | parameter sweep | −0.0036 |
+
+About **30 candidates were considered** in total; 6 accepted (~20 %
+acceptance rate), the rest discarded at screen or robust. Roughly $107 of
+compute at $15.92/hr.
+
+### What worked
+
+- **The single literature pick that landed paid for the night.** EMA at
+  eval alone is 63 % of the total gain. The 90-s budget ends mid-noisy-
+  training; averaging the recent weights before the final eval de-noises
+  the prediction more than any single architectural change did.
+- **Schedule realignment to the *actual* training duration was the
+  biggest agent-original insight** (#2, #3, #5 — combined Δ ≈ −0.035).
+  Record 18's `num_iterations=1390`, `cooldown_frac=0.4`, and sliding-
+  window warmup are tuned for the full speedrun budget; at our 90-s A100
+  budget we only reach step ~265, so cooldown never triggers and the
+  sliding window stays tiny. Compressing the schedule made each
+  mechanism actually fire within the budget.
+
+### What didn't work
+
+The architectural literature picks tried at this short-horizon regime
+**all failed** (Cautious Weight Decay, Peri-LN, V-norm / HybridNorm,
+Muon-VS, MTP-lite). Several lost by wide margins (Peri-LN +0.089, MTP
++0.052). This is itself a useful finding: **record 18 is so heavily
+tuned that net-new architectural changes destabilize more than they help
+in ~265 training steps**. The architectural-leverage regime starts at
+longer horizons.
+
+### The funnel did its job
+
+The strict 10-seed paired bar caught at least one near-miss that a
+naive single-run accept would have promoted:
+
+- `3808a0b` (embed_lr 0.6 → 0.45) screened 3/3 promising but **failed
+  robust 9/10**, losing seed 7 by 0.0007. Correctly discarded.
+- The agent then ran the documented rescue (embed_lr 0.6 → 0.5, smaller
+  step), which passed 10/10 and became KEEP #6.
+
+Without the PROMISING → ESTABLISHED separation, `3808a0b` would have
+overwritten `baseline.tsv` with a baseline that was unfairly low on seed
+7, and every subsequent candidate would have been measured against a
+poisoned reference. This is the design contribution doing visible work.
+
+Full per-candidate log: `box_results/autoresearch-speedrun/results.tsv`
+(gitignored) — pulled back from the box after the run.
 
 ## Status
 
 - [x] Frame staged: record 18 at root, framework contract wired into `train.py`.
 - [x] Two-stage funnel (`screen` 3 seeds → `robust` +7 seeds) documented in `program.md`.
-- [ ] Baseline calibrated on 8× A100 (`baseline.tsv` populated).
-- [ ] First overnight agent run.
+- [x] Baseline calibrated on 8× A100 (mean val_loss 3.9249 at 90 s).
+- [x] First overnight agent run: 6 ESTABLISHED wins, val_loss 3.9249 → 3.8093 (−0.116) in ~6.7 hours.
 
 ## License
 

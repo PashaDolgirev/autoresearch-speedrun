@@ -4,6 +4,9 @@ results.tsv
 run.log
 logs/
 
+# Snapshots of post-run state pulled back from the rented A100 box
+box_results/
+
 # Downloaded data
 data/
 

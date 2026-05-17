@@ -74,6 +74,11 @@ To set up a new experiment, work with the user to:
    - `prepare.py` — one-time FineWeb10B download. **Do not modify.**
    - `run.sh` — wraps `torchrun --standalone --nproc_per_node=8 train.py`,
      passes through `SEED` and `TIME_BUDGET_S`. **Do not modify.**
+   - `run_with_retry.sh` — the wrapper you should actually call. Wraps
+     `bash run.sh` with a 240 s wall-clock watchdog + up to 2 retries to
+     paper over a residual ~20% NCCL hang rate on this A100 + torch combo.
+     Without it, ~1 in 5 seeds hangs silently and you waste a seed.
+     **Do not modify.**
    - `train.py` — the file you modify. Model, optimizer, schedule, training
      loop. Verbatim record-18 modded-nanogpt **except** for a short
      framework-contract block (the `TIME_BUDGET_S` early stop, the `SEED`
@@ -102,7 +107,7 @@ record-18) per-seed val_loss at 90 sec on this machine.
 
 ```
 for SEED in 0 1 2 3 4 5 6 7 8 9; do
-    SEED=$SEED bash run.sh > run.log 2>&1
+    SEED=$SEED bash run_with_retry.sh > run.log 2>&1
     # extract the final val_loss line (the one printed at the time-budget stop)
     grep "val_loss:" run.log | tail -1
 done
@@ -140,10 +145,17 @@ Total wall-clock for the 10 calibration runs: ~25-30 min.
 
 ## Experimentation
 
-Each experiment is launched via `SEED=<n> bash run.sh > run.log 2>&1`. The
+Each experiment is launched via `SEED=<n> bash run_with_retry.sh > run.log 2>&1`.
+That wrapper invokes `bash run.sh` under a 240 s watchdog and retries up to 2
+times if the run hangs (NCCL deadlock; happens ~20% of the time on this
+hardware, see `run_with_retry.sh` header for details). The underlying
 training script writes a per-run log to `logs/<uuid>.txt` and prints key
-lines to console. The final `val_loss:` line in the log is the value at
-the 90-sec budget stop — that's the number you score.
+lines to console. The final `val_loss:` line in the log is the value at the
+90-sec budget stop — that's the number you score.
+
+**Always use `run_with_retry.sh`, never bare `bash run.sh`** — a bare call
+will sit forever if NCCL hangs, silently burning your time budget for the
+night.
 
 **What you CAN do:**
 - Modify `train.py` — model architecture, optimizer, hyperparameters,
@@ -257,7 +269,7 @@ sequential experiments.
 
 **2b. SCREEN — run at seeds 0, 1, 2.** For each seed:
 ```
-SEED=<seed> bash run.sh > run.log 2>&1
+SEED=<seed> bash run_with_retry.sh > run.log 2>&1
 grep "val_loss:" run.log | tail -1     # the final eval line at ~90 sec
 grep "peak memory" run.log | tail -1
 ```
@@ -356,9 +368,12 @@ e5f6g7h	robust	10/10	3.8602	3.8721	keep	cooldown_frac 0.4 -> 0.45
 
 ## Timing and crash handling
 
-**Per-run wall clock**: ~3-5 min on first compile, ~90-120 sec thereafter
-(90 sec of training + ~30 sec val + ~5 sec eval overhead). The compile
-cache survives across runs in the same Python environment.
+**Per-run wall clock**: ~3-5 min on first compile, ~95 sec on a clean run
+thereafter (90 sec of training + ~5 sec val + eval overhead). With the
+240 s watchdog retry in `run_with_retry.sh`, the worst-case per-seed cost
+is ~3 × ~95 sec ≈ 5 min if every attempt hangs (probability ~0.8%); typical
+seeds take 1 attempt (~95 sec) or sometimes 2 (~3 min). The compile cache
+survives across runs in the same Python environment.
 
 **Per-candidate wall clock**:
 - DISCARD (screen fail): 3 runs ≈ 6-9 min.

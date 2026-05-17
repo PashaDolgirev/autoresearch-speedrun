@@ -10,6 +10,21 @@ import contextlib
 from dataclasses import dataclass
 
 import torch
+# -----------------------------------------------------------------------------
+# A100 compat shims (autoresearch-speedrun harness) — DO NOT MODIFY
+# 1) Set device per-rank BEFORE the warmup `.backward()` below, so each rank
+#    fires its warmup on its own GPU. Without this, all 8 ranks warm up on
+#    cuda:0, leaking ~500 MB CUDA contexts onto rank 0 and OOMing the
+#    40 GB A100 later in the lm_head logits allocation.
+# 2) Let inductor fall back to ATen when Triton's autotuner has no candidate.
+#    Required on torch 2.6 for FlexAttention's backward kernel; harmless on
+#    torch 2.7+. NOT an "extra inductor flag" in the speedrun-rule-3 sense
+#    (which bans gain-mechanism flags); this is pure compat — the code
+#    wouldn't run without it on certain torch × A100 combos.
+torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', 0)))
+import torch._inductor.config
+torch._inductor.config.max_autotune_gemm_backends = "ATEN,TRITON"
+# -----------------------------------------------------------------------------
 torch.empty(1, device='cuda', requires_grad=True).backward()
 from torch import nn
 import torch.nn.functional as F
@@ -101,8 +116,16 @@ class Muon(torch.optim.Optimizer):
             def update_prev():
                 if params_world is None:
                     return
-                assert handle is not None
-                handle.wait()
+                # A100 compat — was `assert handle is not None; handle.wait()`.
+                # We switched to sync `all_gather` below to dodge a deterministic
+                # NCCL collective deadlock on torch 2.7.1 + NCCL 2.26.2 around
+                # Muon step 2-12 of training. Costs ~10-15% wall-clock per step
+                # vs the original async overlap. If you (the agent) find an
+                # async / reduce_scatter pattern that does NOT deadlock on this
+                # hardware, swapping it back is fair game and would be a real
+                # speedup — verify with several runs before declaring a win.
+                if handle is not None:
+                    handle.wait()
                 for p_world, g_world in zip(params_world, update_buffers):
                     p_world.data.add_(
                         g_world.view_as(p_world),
@@ -123,7 +146,9 @@ class Muon(torch.optim.Optimizer):
                 else:
                     g = update_buffers[rank]
                 update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
-                handle = dist.all_gather(update_buffers, g, async_op=True)
+                # A100 compat — async_op=True deadlocks on torch 2.7.1+NCCL 2.26.2;
+                # see note in update_prev() above.
+                handle = dist.all_gather(update_buffers, g, async_op=False)
                 params_world = params[base_i : base_i + self.world_size]
             update_prev()
 
