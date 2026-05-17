@@ -6,6 +6,18 @@ clear metric, iterates on language-model-pretraining ideas overnight, and
 the human researcher wakes up to a results log and (hopefully) a better
 model.
 
+**The bet.** In a regime as heavily optimized as the speedrun, *hypothesis
+quality dominates iteration speed*, and statistical rigor on a noisy
+metric matters more than it does in most ML workflows. So this framework
+spends its design budget on two things: a curated literature-backed idea
+pool an agent can actually triage, and a two-stage paired-seed acceptance
+funnel that won't silently poison its own baseline. Given enough nights,
+I think that's the combination that can push the record. One overnight on
+8× A100 cut val_loss from **3.9249 → 3.8093** (−0.116, ~7× the per-run
+noise floor), with **6 accepted changes and ~24 honest discards** — both
+the funnel and the literature pool did visible work. Per-candidate detail
+in the **Results** section below.
+
 This repo is a small, single-author probe of that bet. It composes two
 existing projects:
 
